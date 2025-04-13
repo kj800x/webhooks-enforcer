@@ -2,7 +2,13 @@
 FROM rust:1.85-alpine AS builder
 WORKDIR /usr/src/
 # Install required build dependencies
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev libc-dev gcc
+RUN apk update && \
+  apk add --no-cache \
+  musl-dev \
+  pkgconf \
+  openssl-dev \
+  build-base \
+  openssl-libs-static
 
 # - Install dependencies
 RUN USER=root cargo new webhooks-enforcer

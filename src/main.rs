@@ -75,7 +75,6 @@ struct Repository {
     full_name: String,
     owner: Owner,
     archived: bool,
-    private: bool,
 }
 
 #[derive(Debug, Deserialize)]
