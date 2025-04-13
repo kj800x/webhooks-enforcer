@@ -75,6 +75,7 @@ struct Repository {
     full_name: String,
     owner: Owner,
     archived: bool,
+    private: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,7 +415,7 @@ fn get_org_repositories(client: &Client, org: &str) -> Result<Vec<Repository>, A
 
     loop {
         let url = format!(
-            "https://api.github.com/orgs/{}/repos?page={}&per_page={}",
+            "https://api.github.com/orgs/{}/repos?page={}&per_page={}&type=all",
             org, page, per_page
         );
 
@@ -450,9 +451,10 @@ fn get_user_repositories(client: &Client, username: &str) -> Result<Vec<Reposito
     let per_page = 100;
 
     loop {
+        // Use the authenticated /user/repos endpoint which gives access to private repos
         let url = format!(
-            "https://api.github.com/users/{}/repos?page={}&per_page={}",
-            username, page, per_page
+            "https://api.github.com/user/repos?page={}&per_page={}&affiliation=owner&visibility=all",
+            page, per_page
         );
 
         let response = client.get(&url).send()?;
@@ -468,7 +470,13 @@ fn get_user_repositories(client: &Client, username: &str) -> Result<Vec<Reposito
             break;
         }
 
-        all_repos.extend(repos);
+        // Filter to only include repos owned by the specified user
+        let owned_repos: Vec<Repository> = repos
+            .into_iter()
+            .filter(|r| r.owner.login == username)
+            .collect();
+
+        all_repos.extend(owned_repos);
 
         // Use the previously stored result for pagination
         if !has_next {
