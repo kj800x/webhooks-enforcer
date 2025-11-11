@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: webhooks-enforcer
+  namespace: cicd
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: webhooks-enforcer
+              image: ghcr.io/kj800x/webhooks-enforcer:commit-$SHA
+              command: ["./webhooks-enforcer"]
+              env:
+                - name: GITHUB_PAT
+                  valueFrom:
+                    secretKeyRef:
+                      name: webhooks-enforcer-secret
+                      key: GITHUB_PAT
+                - name: WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: webhooks-enforcer-secret
+                      key: WEBHOOK_URL
+                - name: WEBHOOK_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: webhooks-enforcer-secret
+                      key: WEBHOOK_SECRET
+                - name: REPO_OWNER
+                  value: "kj800x"
+                - name: DRY_RUN
+                  value: "false"
