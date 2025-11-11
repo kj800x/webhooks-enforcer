@@ -1,0 +1,8 @@
+artifactRepo:
+  owner: kj800x
+  repo: webhooks-enforcer
+  branch: master
+
+team: cluster-infra
+kind: job
+namespace: cicd
