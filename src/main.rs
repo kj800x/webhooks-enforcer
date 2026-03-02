@@ -110,7 +110,7 @@ struct AppConfig {
     github_pats: Vec<String>,
     webhook_url: String,
     webhook_secret: String,
-    repo_owner: String,
+    repo_owners: Vec<String>,
     dry_run: bool,
     force_secret: bool,
 }
@@ -178,7 +178,7 @@ fn main() {
                 eprintln!("GITHUB_PAT=token1,token2,... (comma-separated, supports multiple tokens)");
                 eprintln!("WEBHOOK_URL=https://your-webhook-endpoint.example.com/webhook");
                 eprintln!("WEBHOOK_SECRET=your_webhook_secret_key");
-                eprintln!("REPO_OWNER=your_github_username_or_organization");
+                eprintln!("REPO_OWNER=owner1,owner2,... (comma-separated, supports multiple owners)");
                 eprintln!("\nOptional environment variables:");
                 eprintln!("DRY_RUN=true|false (default: false)");
 
@@ -214,8 +214,18 @@ fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
         return Err(AppError::MissingEnvVar("GITHUB_PAT".to_string()));
     }
 
-    let repo_owner =
+    let repo_owner_raw =
         env::var("REPO_OWNER").map_err(|_| AppError::MissingEnvVar("REPO_OWNER".to_string()))?;
+
+    let repo_owners: Vec<String> = repo_owner_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if repo_owners.is_empty() {
+        return Err(AppError::MissingEnvVar("REPO_OWNER".to_string()));
+    }
 
     let webhook_url =
         env::var("WEBHOOK_URL").map_err(|_| AppError::MissingEnvVar("WEBHOOK_URL".to_string()))?;
@@ -227,38 +237,41 @@ fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
     let dry_run =
         cli.dry_run || env::var("DRY_RUN").unwrap_or_else(|_| "false".to_string()) == "true";
 
-    if github_pats.len() > 1 {
-        info!("Loaded {} GitHub tokens", github_pats.len());
+    if github_pats.len() > 1 || repo_owners.len() > 1 {
+        info!(
+            "Loaded {} GitHub token(s) and {} owner(s)",
+            github_pats.len(),
+            repo_owners.len()
+        );
     }
 
     Ok(AppConfig {
         github_pats,
         webhook_url,
         webhook_secret,
-        repo_owner,
+        repo_owners,
         dry_run,
         force_secret: cli.force_secret,
     })
 }
 
 fn list_repositories(config: &AppConfig, only_mismatched: bool) -> Result<(), AppError> {
-    info!("Listing repositories for owner: {}", config.repo_owner);
-
     let mut seen_repos = HashSet::new();
 
     for (i, pat) in config.github_pats.iter().enumerate() {
-        if config.github_pats.len() > 1 {
+        let client = create_github_client(pat)?;
+
+        for owner in &config.repo_owners {
             info!(
-                "Fetching with token {}/{}",
+                "Listing repositories for owner: {} (token {}/{})",
+                owner,
                 i + 1,
                 config.github_pats.len()
             );
-        }
 
-        let client = create_github_client(pat)?;
-        let repositories = get_repositories(&client, &config.repo_owner)?;
+            let repositories = get_repositories(&client, owner)?;
 
-        info!("Found {} repositories with token {}", repositories.len(), i + 1);
+            info!("Found {} repositories", repositories.len());
 
         for repo in repositories {
             if !seen_repos.insert(repo.full_name.clone()) {
@@ -349,6 +362,7 @@ fn list_repositories(config: &AppConfig, only_mismatched: bool) -> Result<(), Ap
                 }
             }
         }
+        }
     }
 
     Ok(())
@@ -363,42 +377,40 @@ fn run(config: &AppConfig) -> Result<(), AppError> {
     let mut seen_repos = HashSet::new();
 
     for (i, pat) in config.github_pats.iter().enumerate() {
-        if config.github_pats.len() > 1 {
+        let client = create_github_client(pat)?;
+
+        for owner in &config.repo_owners {
             info!(
-                "Processing with token {}/{}",
+                "Fetching repositories for owner: {} (token {}/{})",
+                owner,
                 i + 1,
                 config.github_pats.len()
             );
-        }
+            let repositories = get_repositories(&client, owner)?;
 
-        let client = create_github_client(pat)?;
+            // Count non-archived repositories
+            let active_repos = repositories.iter().filter(|r| !r.archived).count();
+            info!(
+                "Found {} repositories ({} active, {} archived)",
+                repositories.len(),
+                active_repos,
+                repositories.len() - active_repos
+            );
 
-        // Get repositories
-        info!("Fetching repositories for owner: {}", config.repo_owner);
-        let repositories = get_repositories(&client, &config.repo_owner)?;
+            // Process each repository
+            for repo in repositories {
+                if repo.archived {
+                    continue;
+                }
 
-        // Count non-archived repositories
-        let active_repos = repositories.iter().filter(|r| !r.archived).count();
-        info!(
-            "Found {} repositories ({} active, {} archived)",
-            repositories.len(),
-            active_repos,
-            repositories.len() - active_repos
-        );
+                if !seen_repos.insert(repo.full_name.clone()) {
+                    debug!("Skipping already-processed repository: {}", repo.full_name);
+                    continue;
+                }
 
-        // Process each repository
-        for repo in repositories {
-            if repo.archived {
-                continue;
+                info!("Processing repository: {}", repo.full_name);
+                process_repository(&client, &repo, config)?;
             }
-
-            if !seen_repos.insert(repo.full_name.clone()) {
-                debug!("Skipping already-processed repository: {}", repo.full_name);
-                continue;
-            }
-
-            info!("Processing repository: {}", repo.full_name);
-            process_repository(&client, &repo, config)?;
         }
     }
 
@@ -857,91 +869,91 @@ fn has_next_page(response: &Response) -> bool {
 }
 
 fn remove_webhooks(config: &AppConfig, all: bool) -> Result<(), AppError> {
-    if all {
-        info!(
-            "Removing ALL webhooks from repositories for owner: {}",
-            config.repo_owner
-        );
-    } else {
-        info!(
-            "Removing webhooks with URL {} from repositories for owner: {}",
-            config.webhook_url, config.repo_owner
-        );
-    }
-
     let mut seen_repos = HashSet::new();
     let mut removed_count = 0;
     let mut processed_count = 0;
     let mut skipped_count = 0;
 
     for (i, pat) in config.github_pats.iter().enumerate() {
-        if config.github_pats.len() > 1 {
-            info!(
-                "Processing with token {}/{}",
-                i + 1,
-                config.github_pats.len()
-            );
-        }
-
         let client = create_github_client(pat)?;
-        let repositories = get_repositories(&client, &config.repo_owner)?;
 
-        // Count non-archived repositories
-        let active_repos = repositories.iter().filter(|r| !r.archived).count();
-        info!(
-            "Found {} repositories ({} active, {} archived)",
-            repositories.len(),
-            active_repos,
-            repositories.len() - active_repos
-        );
-
-        for repo in repositories {
-            // Skip archived repositories
-            if repo.archived {
-                if seen_repos.insert(repo.full_name.clone()) {
-                    debug!("Skipping archived repository: {}", repo.full_name);
-                    skipped_count += 1;
-                }
-                continue;
-            }
-
-            if !seen_repos.insert(repo.full_name.clone()) {
-                continue; // Already processed by a previous token
-            }
-
-            processed_count += 1;
-            let result = if all {
-                remove_all_webhooks_from_repository(&client, &repo, config.dry_run)
+        for owner in &config.repo_owners {
+            if all {
+                info!(
+                    "Removing ALL webhooks from repositories for owner: {} (token {}/{})",
+                    owner,
+                    i + 1,
+                    config.github_pats.len()
+                );
             } else {
-                remove_matching_webhook_from_repository(
-                    &client,
-                    &repo,
-                    &config.webhook_url,
-                    config.dry_run,
-                )
-            };
+                info!(
+                    "Removing webhooks with URL {} from repositories for owner: {} (token {}/{})",
+                    config.webhook_url,
+                    owner,
+                    i + 1,
+                    config.github_pats.len()
+                );
+            }
 
-            match result {
-                Ok(count) => {
-                    removed_count += count;
-                    if count > 0 {
-                        if config.dry_run {
-                            info!(
-                                "[DRY RUN] Would remove {} webhook(s) from {}",
-                                count, repo.full_name
-                            );
-                        } else {
-                            info!("Removed {} webhook(s) from {}", count, repo.full_name);
-                        }
-                    } else {
-                        debug!("No matching webhooks found in {}", repo.full_name);
+            let repositories = get_repositories(&client, owner)?;
+
+            // Count non-archived repositories
+            let active_repos = repositories.iter().filter(|r| !r.archived).count();
+            info!(
+                "Found {} repositories ({} active, {} archived)",
+                repositories.len(),
+                active_repos,
+                repositories.len() - active_repos
+            );
+
+            for repo in repositories {
+                // Skip archived repositories
+                if repo.archived {
+                    if seen_repos.insert(repo.full_name.clone()) {
+                        debug!("Skipping archived repository: {}", repo.full_name);
+                        skipped_count += 1;
                     }
+                    continue;
                 }
-                Err(err) => {
-                    error!(
-                        "Failed to remove webhooks from repository {}: {}",
-                        repo.full_name, err
-                    );
+
+                if !seen_repos.insert(repo.full_name.clone()) {
+                    continue; // Already processed by a previous token/owner
+                }
+
+                processed_count += 1;
+                let result = if all {
+                    remove_all_webhooks_from_repository(&client, &repo, config.dry_run)
+                } else {
+                    remove_matching_webhook_from_repository(
+                        &client,
+                        &repo,
+                        &config.webhook_url,
+                        config.dry_run,
+                    )
+                };
+
+                match result {
+                    Ok(count) => {
+                        removed_count += count;
+                        if count > 0 {
+                            if config.dry_run {
+                                info!(
+                                    "[DRY RUN] Would remove {} webhook(s) from {}",
+                                    count, repo.full_name
+                                );
+                            } else {
+                                info!("Removed {} webhook(s) from {}", count, repo.full_name);
+                            }
+                        } else {
+                            debug!("No matching webhooks found in {}", repo.full_name);
+                        }
+                    }
+                    Err(err) => {
+                        error!(
+                            "Failed to remove webhooks from repository {}: {}",
+                            repo.full_name, err
+                        );
+                    }
                 }
             }
         }
