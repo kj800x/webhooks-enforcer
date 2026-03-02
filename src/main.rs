@@ -6,6 +6,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, LINK, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::process;
 use thiserror::Error;
@@ -106,7 +107,7 @@ struct WebhookCreate {
 }
 
 struct AppConfig {
-    github_pat: String,
+    github_pats: Vec<String>,
     webhook_url: String,
     webhook_secret: String,
     repo_owner: String,
@@ -142,7 +143,7 @@ fn main() {
                 }
                 Some(Commands::Enforce) => {
                     // Enforce webhooks
-                    if let Err(err) = run(config) {
+                    if let Err(err) = run(&config) {
                         error!("Application error: {}", err);
                         process::exit(1);
                     }
@@ -156,7 +157,7 @@ fn main() {
                 }
                 None => {
                     // Default action: enforce webhooks (same as Enforce command)
-                    if let Err(err) = run(config) {
+                    if let Err(err) = run(&config) {
                         error!("Application error: {}", err);
                         process::exit(1);
                     }
@@ -174,7 +175,7 @@ fn main() {
                 eprintln!("2. Setting environment variables directly in your shell\n");
 
                 eprintln!("Required environment variables:");
-                eprintln!("GITHUB_PAT=your_github_personal_access_token");
+                eprintln!("GITHUB_PAT=token1,token2,... (comma-separated, supports multiple tokens)");
                 eprintln!("WEBHOOK_URL=https://your-webhook-endpoint.example.com/webhook");
                 eprintln!("WEBHOOK_SECRET=your_webhook_secret_key");
                 eprintln!("REPO_OWNER=your_github_username_or_organization");
@@ -199,8 +200,19 @@ fn main() {
 
 fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
     // Read all configuration from environment variables
-    let github_pat =
+    let github_pat_raw =
         env::var("GITHUB_PAT").map_err(|_| AppError::MissingEnvVar("GITHUB_PAT".to_string()))?;
+
+    // Support multiple comma-separated tokens
+    let github_pats: Vec<String> = github_pat_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if github_pats.is_empty() {
+        return Err(AppError::MissingEnvVar("GITHUB_PAT".to_string()));
+    }
 
     let repo_owner =
         env::var("REPO_OWNER").map_err(|_| AppError::MissingEnvVar("REPO_OWNER".to_string()))?;
@@ -215,8 +227,12 @@ fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
     let dry_run =
         cli.dry_run || env::var("DRY_RUN").unwrap_or_else(|_| "false".to_string()) == "true";
 
+    if github_pats.len() > 1 {
+        info!("Loaded {} GitHub tokens", github_pats.len());
+    }
+
     Ok(AppConfig {
-        github_pat,
+        github_pats,
         webhook_url,
         webhook_secret,
         repo_owner,
@@ -228,92 +244,108 @@ fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
 fn list_repositories(config: &AppConfig, only_mismatched: bool) -> Result<(), AppError> {
     info!("Listing repositories for owner: {}", config.repo_owner);
 
-    let client = create_github_client(&config.github_pat)?;
-    let repositories = get_repositories(&client, &config.repo_owner)?;
+    let mut seen_repos = HashSet::new();
 
-    info!("Found {} repositories", repositories.len());
-
-    for repo in repositories {
-        // Check if repository is archived
-        if repo.archived {
-            // For listing, we'll show archived repositories but mark them as such
-            println!(
-                "{}: {} (archived: true, webhook: not applicable)",
-                repo.full_name, repo.name
+    for (i, pat) in config.github_pats.iter().enumerate() {
+        if config.github_pats.len() > 1 {
+            info!(
+                "Fetching with token {}/{}",
+                i + 1,
+                config.github_pats.len()
             );
-            continue; // Skip to the next repository
         }
 
-        let hooks = match get_webhooks(&client, &repo.owner.login, &repo.name) {
-            Ok(hooks) => hooks,
-            Err(err) => {
-                // Check if this is a 403 error, which might indicate another issue
-                if let AppError::ApiError { status, message } = &err {
-                    if *status == 403 {
-                        // Print information about permission issues
-                        println!(
-                            "{}: {} (webhook: {}, error: {})",
-                            repo.full_name, repo.name, "unknown", message
+        let client = create_github_client(pat)?;
+        let repositories = get_repositories(&client, &config.repo_owner)?;
+
+        info!("Found {} repositories with token {}", repositories.len(), i + 1);
+
+        for repo in repositories {
+            if !seen_repos.insert(repo.full_name.clone()) {
+                continue; // Already listed by a previous token
+            }
+
+            // Check if repository is archived
+            if repo.archived {
+                // For listing, we'll show archived repositories but mark them as such
+                println!(
+                    "{}: {} (archived: true, webhook: not applicable)",
+                    repo.full_name, repo.name
+                );
+                continue; // Skip to the next repository
+            }
+
+            let hooks = match get_webhooks(&client, &repo.owner.login, &repo.name) {
+                Ok(hooks) => hooks,
+                Err(err) => {
+                    // Check if this is a 403 error, which might indicate another issue
+                    if let AppError::ApiError { status, message } = &err {
+                        if *status == 403 {
+                            // Print information about permission issues
+                            println!(
+                                "{}: {} (webhook: {}, error: {})",
+                                repo.full_name, repo.name, "unknown", message
+                            );
+                            continue; // Skip to the next repository
+                        }
+                    }
+                    return Err(err);
+                }
+            };
+
+            let matching_hook = hooks.iter().find(|h| h.config.url == config.webhook_url);
+
+            let desired_config = WebhookConfig {
+                url: config.webhook_url.clone(),
+                content_type: "json".to_string(),
+                secret: Some(config.webhook_secret.clone()),
+                insecure_ssl: "1".to_string(),
+            };
+
+            match matching_hook {
+                Some(hook) => {
+                    // Check if secret is masked (GitHub returns asterisks for security)
+                    let is_secret_masked = hook
+                        .config
+                        .secret
+                        .as_ref()
+                        .map_or(false, |s| s.chars().all(|c| c == '*'));
+
+                    // Only count secret as needing update if it's not masked or we're forcing secret updates
+                    let needs_secret_update = if is_secret_masked && !config.force_secret {
+                        debug!(
+                            "Webhook for {} has a masked secret ('********'). Assuming it's correct. Use --force-secret to override.",
+                            repo.full_name
                         );
-                        continue; // Skip to the next repository
+                        false // Assume masked secret is correct unless force_secret is true
+                    } else if is_secret_masked && config.force_secret {
+                        info!(
+                            "Webhook for {} has a masked secret but --force-secret is enabled. Will update secret.",
+                            repo.full_name
+                        );
+                        true
+                    } else {
+                        hook.config.secret != desired_config.secret
+                    };
+
+                    let needs_update = hook.config.content_type != desired_config.content_type
+                        || needs_secret_update
+                        || hook.config.insecure_ssl != desired_config.insecure_ssl
+                        || hook.events != vec!["*".to_string()]
+                        || !hook.active;
+
+                    if !only_mismatched || needs_update {
+                        println!(
+                            "{}: {} (webhook: {}, needs update: {})",
+                            repo.full_name, repo.name, "configured", needs_update
+                        );
                     }
                 }
-                return Err(err);
-            }
-        };
-
-        let matching_hook = hooks.iter().find(|h| h.config.url == config.webhook_url);
-
-        let desired_config = WebhookConfig {
-            url: config.webhook_url.clone(),
-            content_type: "json".to_string(),
-            secret: Some(config.webhook_secret.clone()),
-            insecure_ssl: "1".to_string(),
-        };
-
-        match matching_hook {
-            Some(hook) => {
-                // Check if secret is masked (GitHub returns asterisks for security)
-                let is_secret_masked = hook
-                    .config
-                    .secret
-                    .as_ref()
-                    .map_or(false, |s| s.chars().all(|c| c == '*'));
-
-                // Only count secret as needing update if it's not masked or we're forcing secret updates
-                let needs_secret_update = if is_secret_masked && !config.force_secret {
-                    debug!(
-                        "Webhook for {} has a masked secret ('********'). Assuming it's correct. Use --force-secret to override.",
-                        repo.full_name
-                    );
-                    false // Assume masked secret is correct unless force_secret is true
-                } else if is_secret_masked && config.force_secret {
-                    info!(
-                        "Webhook for {} has a masked secret but --force-secret is enabled. Will update secret.",
-                        repo.full_name
-                    );
-                    true
-                } else {
-                    hook.config.secret != desired_config.secret
-                };
-
-                let needs_update = hook.config.content_type != desired_config.content_type
-                    || needs_secret_update
-                    || hook.config.insecure_ssl != desired_config.insecure_ssl
-                    || hook.events != vec!["*".to_string()]
-                    || !hook.active;
-
-                if !only_mismatched || needs_update {
-                    println!(
-                        "{}: {} (webhook: {}, needs update: {})",
-                        repo.full_name, repo.name, "configured", needs_update
-                    );
-                }
-            }
-            None => {
-                if !only_mismatched || true {
-                    // Always show missing webhooks
-                    println!("{}: {} (webhook: {})", repo.full_name, repo.name, "missing");
+                None => {
+                    if !only_mismatched || true {
+                        // Always show missing webhooks
+                        println!("{}: {} (webhook: {})", repo.full_name, repo.name, "missing");
+                    }
                 }
             }
         }
@@ -322,36 +354,52 @@ fn list_repositories(config: &AppConfig, only_mismatched: bool) -> Result<(), Ap
     Ok(())
 }
 
-fn run(config: AppConfig) -> Result<(), AppError> {
+fn run(config: &AppConfig) -> Result<(), AppError> {
     info!("Starting GitHub webhook enforcer");
     if config.dry_run {
         info!("DRY RUN MODE: No changes will be made");
     }
 
-    let client = create_github_client(&config.github_pat)?;
+    let mut seen_repos = HashSet::new();
 
-    // Get repositories
-    info!("Fetching repositories for owner: {}", config.repo_owner);
-    let repositories = get_repositories(&client, &config.repo_owner)?;
-
-    // Count non-archived repositories
-    let active_repos = repositories.iter().filter(|r| !r.archived).count();
-    info!(
-        "Found {} repositories ({} active, {} archived)",
-        repositories.len(),
-        active_repos,
-        repositories.len() - active_repos
-    );
-
-    // Process each repository
-    for repo in repositories {
-        // Skip logging for archived repositories completely
-        if repo.archived {
-            continue; // Skip silently
+    for (i, pat) in config.github_pats.iter().enumerate() {
+        if config.github_pats.len() > 1 {
+            info!(
+                "Processing with token {}/{}",
+                i + 1,
+                config.github_pats.len()
+            );
         }
 
-        info!("Processing repository: {}", repo.full_name);
-        process_repository(&client, &repo, &config)?;
+        let client = create_github_client(pat)?;
+
+        // Get repositories
+        info!("Fetching repositories for owner: {}", config.repo_owner);
+        let repositories = get_repositories(&client, &config.repo_owner)?;
+
+        // Count non-archived repositories
+        let active_repos = repositories.iter().filter(|r| !r.archived).count();
+        info!(
+            "Found {} repositories ({} active, {} archived)",
+            repositories.len(),
+            active_repos,
+            repositories.len() - active_repos
+        );
+
+        // Process each repository
+        for repo in repositories {
+            if repo.archived {
+                continue;
+            }
+
+            if !seen_repos.insert(repo.full_name.clone()) {
+                debug!("Skipping already-processed repository: {}", repo.full_name);
+                continue;
+            }
+
+            info!("Processing repository: {}", repo.full_name);
+            process_repository(&client, &repo, config)?;
+        }
     }
 
     info!("Webhook enforcement completed successfully");
@@ -821,63 +869,80 @@ fn remove_webhooks(config: &AppConfig, all: bool) -> Result<(), AppError> {
         );
     }
 
-    let client = create_github_client(&config.github_pat)?;
-    let repositories = get_repositories(&client, &config.repo_owner)?;
-
-    // Count non-archived repositories
-    let active_repos = repositories.iter().filter(|r| !r.archived).count();
-    info!(
-        "Found {} repositories ({} active, {} archived)",
-        repositories.len(),
-        active_repos,
-        repositories.len() - active_repos
-    );
-
+    let mut seen_repos = HashSet::new();
     let mut removed_count = 0;
     let mut processed_count = 0;
     let mut skipped_count = 0;
 
-    for repo in repositories {
-        // Skip archived repositories
-        if repo.archived {
-            debug!("Skipping archived repository: {}", repo.full_name);
-            skipped_count += 1;
-            continue;
+    for (i, pat) in config.github_pats.iter().enumerate() {
+        if config.github_pats.len() > 1 {
+            info!(
+                "Processing with token {}/{}",
+                i + 1,
+                config.github_pats.len()
+            );
         }
 
-        processed_count += 1;
-        let result = if all {
-            remove_all_webhooks_from_repository(&client, &repo, config.dry_run)
-        } else {
-            remove_matching_webhook_from_repository(
-                &client,
-                &repo,
-                &config.webhook_url,
-                config.dry_run,
-            )
-        };
+        let client = create_github_client(pat)?;
+        let repositories = get_repositories(&client, &config.repo_owner)?;
 
-        match result {
-            Ok(count) => {
-                removed_count += count;
-                if count > 0 {
-                    if config.dry_run {
-                        info!(
-                            "[DRY RUN] Would remove {} webhook(s) from {}",
-                            count, repo.full_name
-                        );
-                    } else {
-                        info!("Removed {} webhook(s) from {}", count, repo.full_name);
-                    }
-                } else {
-                    debug!("No matching webhooks found in {}", repo.full_name);
+        // Count non-archived repositories
+        let active_repos = repositories.iter().filter(|r| !r.archived).count();
+        info!(
+            "Found {} repositories ({} active, {} archived)",
+            repositories.len(),
+            active_repos,
+            repositories.len() - active_repos
+        );
+
+        for repo in repositories {
+            // Skip archived repositories
+            if repo.archived {
+                if seen_repos.insert(repo.full_name.clone()) {
+                    debug!("Skipping archived repository: {}", repo.full_name);
+                    skipped_count += 1;
                 }
+                continue;
             }
-            Err(err) => {
-                error!(
-                    "Failed to remove webhooks from repository {}: {}",
-                    repo.full_name, err
-                );
+
+            if !seen_repos.insert(repo.full_name.clone()) {
+                continue; // Already processed by a previous token
+            }
+
+            processed_count += 1;
+            let result = if all {
+                remove_all_webhooks_from_repository(&client, &repo, config.dry_run)
+            } else {
+                remove_matching_webhook_from_repository(
+                    &client,
+                    &repo,
+                    &config.webhook_url,
+                    config.dry_run,
+                )
+            };
+
+            match result {
+                Ok(count) => {
+                    removed_count += count;
+                    if count > 0 {
+                        if config.dry_run {
+                            info!(
+                                "[DRY RUN] Would remove {} webhook(s) from {}",
+                                count, repo.full_name
+                            );
+                        } else {
+                            info!("Removed {} webhook(s) from {}", count, repo.full_name);
+                        }
+                    } else {
+                        debug!("No matching webhooks found in {}", repo.full_name);
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to remove webhooks from repository {}: {}",
+                        repo.full_name, err
+                    );
+                }
             }
         }
     }
