@@ -5,6 +5,7 @@ metadata:
   namespace: cicd
 spec:
   schedule: daily
+  cleanupAfter: 2m
   acceptanceTest: false
   spec:
     restartPolicy: Never
