@@ -8,6 +8,8 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process;
 use thiserror::Error;
 
@@ -113,6 +115,20 @@ struct AppConfig {
     repo_owners: Vec<String>,
     dry_run: bool,
     force_secret: bool,
+}
+
+#[derive(Debug)]
+enum RepoResult {
+    AlreadyCorrect,
+    Fixed,
+    Skipped,
+}
+
+#[derive(Serialize)]
+struct JobOutput {
+    repos_discovered: usize,
+    repos_already_correct: usize,
+    repos_fixed: usize,
 }
 
 // Add RateLimit struct to track GitHub API rate limits
@@ -375,6 +391,9 @@ fn run(config: &AppConfig) -> Result<(), AppError> {
     }
 
     let mut seen_repos = HashSet::new();
+    let mut repos_discovered: usize = 0;
+    let mut repos_already_correct: usize = 0;
+    let mut repos_fixed: usize = 0;
 
     for (i, pat) in config.github_pats.iter().enumerate() {
         let client = create_github_client(pat)?;
@@ -408,14 +427,50 @@ fn run(config: &AppConfig) -> Result<(), AppError> {
                     continue;
                 }
 
+                repos_discovered += 1;
                 info!("Processing repository: {}", repo.full_name);
-                process_repository(&client, &repo, config)?;
+                match process_repository(&client, &repo, config)? {
+                    RepoResult::AlreadyCorrect => repos_already_correct += 1,
+                    RepoResult::Fixed => repos_fixed += 1,
+                    RepoResult::Skipped => {}
+                }
             }
         }
     }
 
     info!("Webhook enforcement completed successfully");
+    info!(
+        "Summary: {} repos discovered, {} already correct, {} fixed",
+        repos_discovered, repos_already_correct, repos_fixed
+    );
+
+    write_job_output(repos_discovered, repos_already_correct, repos_fixed);
+
     Ok(())
+}
+
+fn write_job_output(repos_discovered: usize, repos_already_correct: usize, repos_fixed: usize) {
+    let job_output_dir = Path::new("/job-output");
+    if !job_output_dir.is_dir() {
+        return;
+    }
+
+    let result = JobOutput {
+        repos_discovered,
+        repos_already_correct,
+        repos_fixed,
+    };
+
+    match serde_json::to_string_pretty(&result) {
+        Ok(json) => {
+            let path = job_output_dir.join("result.json");
+            match fs::write(&path, json) {
+                Ok(_) => info!("Wrote job output to {}", path.display()),
+                Err(err) => warn!("Failed to write job output to {}: {}", path.display(), err),
+            }
+        }
+        Err(err) => warn!("Failed to serialize job output: {}", err),
+    }
 }
 
 fn create_github_client(github_pat: &str) -> Result<Client, reqwest::Error> {
@@ -552,12 +607,12 @@ fn process_repository(
     client: &Client,
     repo: &Repository,
     config: &AppConfig,
-) -> Result<(), AppError> {
+) -> Result<RepoResult, AppError> {
     // Check if repository is archived and silently skip it
     if repo.archived {
         // Skip without logging any warnings or errors
         debug!("Skipping archived repository: {}", repo.full_name);
-        return Ok(());
+        return Ok(RepoResult::Skipped);
     }
 
     // List existing webhooks
@@ -569,7 +624,7 @@ fn process_repository(
                 if *status == 403 {
                     // Give a more specific message for archived repositories
                     info!("Skipping repository {}: {}", repo.full_name, message);
-                    return Ok(()); // Skip this repository rather than failing the entire process
+                    return Ok(RepoResult::Skipped);
                 }
             }
             return Err(err);
@@ -639,7 +694,7 @@ fn process_repository(
                                         "Could not update webhook for {}: {}",
                                         repo.full_name, message
                                     );
-                                    return Ok(()); // Continue with other repositories
+                                    return Ok(RepoResult::Skipped);
                                 }
                             }
                             return Err(err);
@@ -648,11 +703,13 @@ fn process_repository(
                 } else {
                     info!("[DRY RUN] Would update webhook for {}", repo.full_name);
                 }
+                Ok(RepoResult::Fixed)
             } else {
                 info!(
                     "Webhook for {} is already configured correctly",
                     repo.full_name
                 );
+                Ok(RepoResult::AlreadyCorrect)
             }
         }
         None => {
@@ -670,7 +727,7 @@ fn process_repository(
                                     "Could not create webhook for {}: {}",
                                     repo.full_name, message
                                 );
-                                return Ok(()); // Continue with other repositories
+                                return Ok(RepoResult::Skipped);
                             }
                         }
                         return Err(err);
@@ -679,10 +736,9 @@ fn process_repository(
             } else {
                 info!("[DRY RUN] Would create webhook for {}", repo.full_name);
             }
+            Ok(RepoResult::Fixed)
         }
     }
-
-    Ok(())
 }
 
 fn get_webhooks(client: &Client, owner: &str, repo: &str) -> Result<Vec<Webhook>, AppError> {
