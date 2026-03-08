@@ -4,7 +4,7 @@ metadata:
   name: webhooks-enforcer
   namespace: cicd
 spec:
-  schedule: daily
+  schedule: "*/5 * * * *"
   cleanupAfter: 2m
   acceptanceTest: false
   spec:
