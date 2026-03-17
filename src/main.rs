@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
 use log::{debug, error, info, warn};
+use redis::Commands as RedisCommands;
 use reqwest::{
     blocking::{Client, Response},
     header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, LINK, USER_AGENT},
@@ -70,6 +71,9 @@ enum AppError {
 
     #[error("API error: {status} - {message}")]
     ApiError { status: u16, message: String },
+
+    #[error("Redis error: {0}")]
+    RedisError(#[from] redis::RedisError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,7 +119,12 @@ struct AppConfig {
     repo_owners: Vec<String>,
     dry_run: bool,
     force_secret: bool,
+    redis_url: Option<String>,
 }
+
+const CACHE_TTL_SECS: u64 = 3600; // 1 hour
+const REDIS_KEY_PREFIX: &str = "webhooks-enforcer";
+const REDIS_LAST_FULL_SCAN_KEY: &str = "webhooks-enforcer:last-full-scan";
 
 #[derive(Debug)]
 enum RepoResult {
@@ -261,6 +270,8 @@ fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
         );
     }
 
+    let redis_url = env::var("REDIS_URL").ok();
+
     Ok(AppConfig {
         github_pats,
         webhook_url,
@@ -268,6 +279,7 @@ fn load_config_with_cli(cli: &Cli) -> Result<AppConfig, AppError> {
         repo_owners,
         dry_run,
         force_secret: cli.force_secret,
+        redis_url,
     })
 }
 
@@ -384,16 +396,94 @@ fn list_repositories(config: &AppConfig, only_mismatched: bool) -> Result<(), Ap
     Ok(())
 }
 
+fn connect_redis(config: &AppConfig) -> Option<redis::Connection> {
+    let url = config.redis_url.as_deref()?;
+    match redis::Client::open(url) {
+        Ok(client) => match client.get_connection() {
+            Ok(conn) => {
+                info!("Connected to Redis at {}", url);
+                Some(conn)
+            }
+            Err(e) => {
+                warn!("Failed to connect to Redis: {}. Running without cache.", e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("Invalid Redis URL: {}. Running without cache.", e);
+            None
+        }
+    }
+}
+
+fn is_repo_cached(conn: &mut redis::Connection, repo_full_name: &str) -> bool {
+    let key = format!("{}:repo:{}", REDIS_KEY_PREFIX, repo_full_name);
+    redis::cmd("EXISTS")
+        .arg(&key)
+        .query::<bool>(conn)
+        .unwrap_or(false)
+}
+
+fn cache_repo_ok(conn: &mut redis::Connection, repo_full_name: &str) {
+    let key = format!("{}:repo:{}", REDIS_KEY_PREFIX, repo_full_name);
+    let _: Result<(), _> = conn.set_ex(&key, "ok", CACHE_TTL_SECS);
+}
+
+fn is_full_scan_needed(conn: &mut redis::Connection) -> bool {
+    let last_scan: Option<u64> = conn.get(REDIS_LAST_FULL_SCAN_KEY).ok();
+    match last_scan {
+        Some(ts) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let elapsed = now.saturating_sub(ts);
+            if elapsed >= CACHE_TTL_SECS {
+                info!(
+                    "Last full scan was {} seconds ago (>= {}s threshold). Running full scan.",
+                    elapsed, CACHE_TTL_SECS
+                );
+                true
+            } else {
+                info!(
+                    "Last full scan was {} seconds ago (< {}s threshold). Using cache for already-checked repos.",
+                    elapsed, CACHE_TTL_SECS
+                );
+                false
+            }
+        }
+        None => {
+            info!("No previous full scan recorded. Running full scan.");
+            true
+        }
+    }
+}
+
+fn mark_full_scan_done(conn: &mut redis::Connection) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _: Result<(), _> = conn.set_ex(REDIS_LAST_FULL_SCAN_KEY, now, CACHE_TTL_SECS);
+}
+
 fn run(config: &AppConfig) -> Result<(), AppError> {
     info!("Starting GitHub webhook enforcer");
     if config.dry_run {
         info!("DRY RUN MODE: No changes will be made");
     }
 
+    let mut redis_conn = connect_redis(config);
+    let full_scan = match redis_conn.as_mut() {
+        Some(conn) => is_full_scan_needed(conn),
+        None => true, // No Redis = always full scan
+    };
+
     let mut seen_repos = HashSet::new();
     let mut repos_discovered: usize = 0;
     let mut repos_already_correct: usize = 0;
     let mut repos_fixed: usize = 0;
+    let mut repos_cached: usize = 0;
 
     for (i, pat) in config.github_pats.iter().enumerate() {
         let client = create_github_client(pat)?;
@@ -428,21 +518,60 @@ fn run(config: &AppConfig) -> Result<(), AppError> {
                 }
 
                 repos_discovered += 1;
+
+                // If not a full scan, check if this repo is already cached as OK
+                if !full_scan {
+                    if let Some(conn) = redis_conn.as_mut() {
+                        if is_repo_cached(conn, &repo.full_name) {
+                            debug!("Skipping cached repo: {}", repo.full_name);
+                            repos_cached += 1;
+                            repos_already_correct += 1;
+                            continue;
+                        }
+                    }
+                }
+
                 info!("Processing repository: {}", repo.full_name);
                 match process_repository(&client, &repo, config)? {
-                    RepoResult::AlreadyCorrect => repos_already_correct += 1,
-                    RepoResult::Fixed => repos_fixed += 1,
+                    RepoResult::AlreadyCorrect => {
+                        repos_already_correct += 1;
+                        // Cache this repo as OK
+                        if let Some(conn) = redis_conn.as_mut() {
+                            cache_repo_ok(conn, &repo.full_name);
+                        }
+                    }
+                    RepoResult::Fixed => {
+                        repos_fixed += 1;
+                        // Cache the fixed repo as OK too (it's correct now)
+                        if let Some(conn) = redis_conn.as_mut() {
+                            cache_repo_ok(conn, &repo.full_name);
+                        }
+                    }
                     RepoResult::Skipped => {}
                 }
             }
         }
     }
 
+    // Mark full scan as done if we did one
+    if full_scan {
+        if let Some(conn) = redis_conn.as_mut() {
+            mark_full_scan_done(conn);
+        }
+    }
+
     info!("Webhook enforcement completed successfully");
-    info!(
-        "Summary: {} repos discovered, {} already correct, {} fixed",
-        repos_discovered, repos_already_correct, repos_fixed
-    );
+    if repos_cached > 0 {
+        info!(
+            "Summary: {} repos discovered, {} already correct ({} from cache), {} fixed",
+            repos_discovered, repos_already_correct, repos_cached, repos_fixed
+        );
+    } else {
+        info!(
+            "Summary: {} repos discovered, {} already correct, {} fixed",
+            repos_discovered, repos_already_correct, repos_fixed
+        );
+    }
 
     write_job_output(repos_discovered, repos_already_correct, repos_fixed);
 

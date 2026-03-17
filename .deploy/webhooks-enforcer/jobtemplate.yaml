@@ -33,3 +33,5 @@ spec:
             value: "kj800x"
           - name: DRY_RUN
             value: "false"
+          - name: REDIS_URL
+            value: "redis://redis.redis.svc.cluster.local:6379"
