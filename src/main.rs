@@ -124,7 +124,6 @@ struct AppConfig {
 
 const CACHE_TTL_SECS: u64 = 3600; // 1 hour
 const REDIS_KEY_PREFIX: &str = "webhooks-enforcer";
-const REDIS_LAST_FULL_SCAN_KEY: &str = "webhooks-enforcer:last-full-scan";
 
 #[derive(Debug)]
 enum RepoResult {
@@ -429,8 +428,13 @@ fn cache_repo_ok(conn: &mut redis::Connection, repo_full_name: &str) {
     let _: Result<(), _> = conn.set_ex(&key, "ok", CACHE_TTL_SECS);
 }
 
-fn is_full_scan_needed(conn: &mut redis::Connection) -> bool {
-    let last_scan: Option<u64> = conn.get(REDIS_LAST_FULL_SCAN_KEY).ok();
+fn full_scan_key(owners: &[String]) -> String {
+    format!("{}:{}:last-full-scan", REDIS_KEY_PREFIX, owners.join(","))
+}
+
+fn is_full_scan_needed(conn: &mut redis::Connection, owners: &[String]) -> bool {
+    let key = full_scan_key(owners);
+    let last_scan: Option<u64> = conn.get(&key).ok();
     match last_scan {
         Some(ts) => {
             let now = std::time::SystemTime::now()
@@ -459,12 +463,13 @@ fn is_full_scan_needed(conn: &mut redis::Connection) -> bool {
     }
 }
 
-fn mark_full_scan_done(conn: &mut redis::Connection) {
+fn mark_full_scan_done(conn: &mut redis::Connection, owners: &[String]) {
+    let key = full_scan_key(owners);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let _: Result<(), _> = conn.set_ex(REDIS_LAST_FULL_SCAN_KEY, now, CACHE_TTL_SECS);
+    let _: Result<(), _> = conn.set_ex(&key, now, CACHE_TTL_SECS);
 }
 
 fn run(config: &AppConfig) -> Result<(), AppError> {
@@ -475,7 +480,7 @@ fn run(config: &AppConfig) -> Result<(), AppError> {
 
     let mut redis_conn = connect_redis(config);
     let full_scan = match redis_conn.as_mut() {
-        Some(conn) => is_full_scan_needed(conn),
+        Some(conn) => is_full_scan_needed(conn, &config.repo_owners),
         None => true, // No Redis = always full scan
     };
 
@@ -556,7 +561,7 @@ fn run(config: &AppConfig) -> Result<(), AppError> {
     // Mark full scan as done if we did one
     if full_scan {
         if let Some(conn) = redis_conn.as_mut() {
-            mark_full_scan_done(conn);
+            mark_full_scan_done(conn, &config.repo_owners);
         }
     }
 
