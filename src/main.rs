@@ -124,6 +124,8 @@ struct AppConfig {
 
 const CACHE_TTL_SECS: u64 = 3600; // 1 hour
 const REDIS_KEY_PREFIX: &str = "webhooks-enforcer";
+const MAX_RETRIES: u32 = 3;
+const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 
 #[derive(Debug)]
 enum RepoResult {
@@ -607,6 +609,55 @@ fn write_job_output(repos_discovered: usize, repos_already_correct: usize, repos
     }
 }
 
+fn is_transient_error(err: &reqwest::Error) -> bool {
+    err.is_timeout()
+        || err.is_connect()
+        || err
+            .status()
+            .map_or(false, |s| s.is_server_error())
+}
+
+fn send_with_retry(
+    request_builder: impl Fn() -> reqwest::blocking::RequestBuilder,
+) -> Result<Response, reqwest::Error> {
+    let mut last_err = None;
+    for attempt in 0..=MAX_RETRIES {
+        match request_builder().send() {
+            Ok(response) => {
+                // Retry on 5xx server errors
+                if response.status().is_server_error() && attempt < MAX_RETRIES {
+                    let delay = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt);
+                    warn!(
+                        "Server error {} from {}, retrying in {}ms (attempt {}/{})",
+                        response.status(),
+                        response.url().clone(),
+                        delay,
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(err) => {
+                if is_transient_error(&err) && attempt < MAX_RETRIES {
+                    let delay = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt);
+                    warn!(
+                        "Transient error: {}, retrying in {}ms (attempt {}/{})",
+                        err, delay, attempt + 1, MAX_RETRIES
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    last_err = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
 fn create_github_client(github_pat: &str) -> Result<Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -667,7 +718,7 @@ fn get_org_repositories(client: &Client, org: &str) -> Result<Vec<Repository>, A
             org, page, per_page
         );
 
-        let response = client.get(&url).send()?;
+        let response = send_with_retry(|| client.get(&url))?;
 
         // Check for next page before consuming response body
         let has_next = has_next_page(&response);
@@ -705,7 +756,7 @@ fn get_user_repositories(client: &Client, username: &str) -> Result<Vec<Reposito
             page, per_page
         );
 
-        let response = client.get(&url).send()?;
+        let response = send_with_retry(|| client.get(&url))?;
 
         // Check for next page before consuming response body
         let has_next = has_next_page(&response);
@@ -877,7 +928,7 @@ fn process_repository(
 
 fn get_webhooks(client: &Client, owner: &str, repo: &str) -> Result<Vec<Webhook>, AppError> {
     let url = format!("https://api.github.com/repos/{}/{}/hooks", owner, repo);
-    let response = client.get(&url).send()?;
+    let response = send_with_retry(|| client.get(&url))?;
     check_response_status(&response)?;
 
     let hooks: Vec<Webhook> = response.json()?;
@@ -903,7 +954,7 @@ fn create_webhook(
         active: true,
     };
 
-    let response = client.post(&url).json(&webhook).send()?;
+    let response = send_with_retry(|| client.post(&url).json(&webhook))?;
     check_response_status(&response)?;
 
     Ok(())
@@ -932,7 +983,7 @@ fn update_webhook(
         active: true,
     };
 
-    let response = client.patch(&url).json(&webhook).send()?;
+    let response = send_with_retry(|| client.patch(&url).json(&webhook))?;
     check_response_status(&response)?;
 
     Ok(())
@@ -1232,7 +1283,7 @@ fn remove_webhook(client: &Client, owner: &str, repo: &str, hook_id: u64) -> Res
         "https://api.github.com/repos/{}/{}/hooks/{}",
         owner, repo, hook_id
     );
-    let response = client.delete(&url).send()?;
+    let response = send_with_retry(|| client.delete(&url))?;
     check_response_status(&response)?;
 
     Ok(())
