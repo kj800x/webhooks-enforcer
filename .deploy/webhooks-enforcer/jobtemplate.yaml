@@ -6,6 +6,7 @@ metadata:
 spec:
   schedule: "*/5 * * * *"
   cleanupAfter: 2m
+  maxPermittedConsecutiveFailures: 2
   acceptanceTest: false
   spec:
     restartPolicy: Never
