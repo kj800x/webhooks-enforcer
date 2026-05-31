@@ -201,10 +201,14 @@ fn main() {
                 eprintln!("2. Setting environment variables directly in your shell\n");
 
                 eprintln!("Required environment variables:");
-                eprintln!("GITHUB_PAT=token1,token2,... (comma-separated, supports multiple tokens)");
+                eprintln!(
+                    "GITHUB_PAT=token1,token2,... (comma-separated, supports multiple tokens)"
+                );
                 eprintln!("WEBHOOK_URL=https://your-webhook-endpoint.example.com/webhook");
                 eprintln!("WEBHOOK_SECRET=your_webhook_secret_key");
-                eprintln!("REPO_OWNER=owner1,owner2,... (comma-separated, supports multiple owners)");
+                eprintln!(
+                    "REPO_OWNER=owner1,owner2,... (comma-separated, supports multiple owners)"
+                );
                 eprintln!("\nOptional environment variables:");
                 eprintln!("DRY_RUN=true|false (default: false)");
 
@@ -302,95 +306,95 @@ fn list_repositories(config: &AppConfig, only_mismatched: bool) -> Result<(), Ap
 
             info!("Found {} repositories", repositories.len());
 
-        for repo in repositories {
-            if !seen_repos.insert(repo.full_name.clone()) {
-                continue; // Already listed by a previous token
-            }
-
-            // Check if repository is archived
-            if repo.archived {
-                // For listing, we'll show archived repositories but mark them as such
-                println!(
-                    "{}: {} (archived: true, webhook: not applicable)",
-                    repo.full_name, repo.name
-                );
-                continue; // Skip to the next repository
-            }
-
-            let hooks = match get_webhooks(&client, &repo.owner.login, &repo.name) {
-                Ok(hooks) => hooks,
-                Err(err) => {
-                    // Check if this is a 403 error, which might indicate another issue
-                    if let AppError::ApiError { status, message } = &err {
-                        if *status == 403 {
-                            // Print information about permission issues
-                            println!(
-                                "{}: {} (webhook: {}, error: {})",
-                                repo.full_name, repo.name, "unknown", message
-                            );
-                            continue; // Skip to the next repository
-                        }
-                    }
-                    return Err(err);
+            for repo in repositories {
+                if !seen_repos.insert(repo.full_name.clone()) {
+                    continue; // Already listed by a previous token
                 }
-            };
 
-            let matching_hook = hooks.iter().find(|h| h.config.url == config.webhook_url);
+                // Check if repository is archived
+                if repo.archived {
+                    // For listing, we'll show archived repositories but mark them as such
+                    println!(
+                        "{}: {} (archived: true, webhook: not applicable)",
+                        repo.full_name, repo.name
+                    );
+                    continue; // Skip to the next repository
+                }
 
-            let desired_config = WebhookConfig {
-                url: config.webhook_url.clone(),
-                content_type: "json".to_string(),
-                secret: Some(config.webhook_secret.clone()),
-                insecure_ssl: "1".to_string(),
-            };
+                let hooks = match get_webhooks(&client, &repo.owner.login, &repo.name) {
+                    Ok(hooks) => hooks,
+                    Err(err) => {
+                        // Check if this is a 403 error, which might indicate another issue
+                        if let AppError::ApiError { status, message } = &err {
+                            if *status == 403 {
+                                // Print information about permission issues
+                                println!(
+                                    "{}: {} (webhook: unknown, error: {})",
+                                    repo.full_name, repo.name, message
+                                );
+                                continue; // Skip to the next repository
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
 
-            match matching_hook {
-                Some(hook) => {
-                    // Check if secret is masked (GitHub returns asterisks for security)
-                    let is_secret_masked = hook
-                        .config
-                        .secret
-                        .as_ref()
-                        .map_or(false, |s| s.chars().all(|c| c == '*'));
+                let matching_hook = hooks.iter().find(|h| h.config.url == config.webhook_url);
 
-                    // Only count secret as needing update if it's not masked or we're forcing secret updates
-                    let needs_secret_update = if is_secret_masked && !config.force_secret {
-                        debug!(
+                let desired_config = WebhookConfig {
+                    url: config.webhook_url.clone(),
+                    content_type: "json".to_string(),
+                    secret: Some(config.webhook_secret.clone()),
+                    insecure_ssl: "1".to_string(),
+                };
+
+                match matching_hook {
+                    Some(hook) => {
+                        // Check if secret is masked (GitHub returns asterisks for security)
+                        let is_secret_masked = hook
+                            .config
+                            .secret
+                            .as_ref()
+                            .is_some_and(|s| s.chars().all(|c| c == '*'));
+
+                        // Only count secret as needing update if it's not masked or we're forcing secret updates
+                        let needs_secret_update = if is_secret_masked && !config.force_secret {
+                            debug!(
                             "Webhook for {} has a masked secret ('********'). Assuming it's correct. Use --force-secret to override.",
                             repo.full_name
                         );
-                        false // Assume masked secret is correct unless force_secret is true
-                    } else if is_secret_masked && config.force_secret {
-                        info!(
+                            false // Assume masked secret is correct unless force_secret is true
+                        } else if is_secret_masked && config.force_secret {
+                            info!(
                             "Webhook for {} has a masked secret but --force-secret is enabled. Will update secret.",
                             repo.full_name
                         );
-                        true
-                    } else {
-                        hook.config.secret != desired_config.secret
-                    };
+                            true
+                        } else {
+                            hook.config.secret != desired_config.secret
+                        };
 
-                    let needs_update = hook.config.content_type != desired_config.content_type
-                        || needs_secret_update
-                        || hook.config.insecure_ssl != desired_config.insecure_ssl
-                        || hook.events != vec!["*".to_string()]
-                        || !hook.active;
+                        let needs_update = hook.config.content_type != desired_config.content_type
+                            || needs_secret_update
+                            || hook.config.insecure_ssl != desired_config.insecure_ssl
+                            || hook.events != vec!["*".to_string()]
+                            || !hook.active;
 
-                    if !only_mismatched || needs_update {
-                        println!(
-                            "{}: {} (webhook: {}, needs update: {})",
-                            repo.full_name, repo.name, "configured", needs_update
-                        );
+                        if !only_mismatched || needs_update {
+                            println!(
+                                "{}: {} (webhook: configured, needs update: {})",
+                                repo.full_name, repo.name, needs_update
+                            );
+                        }
                     }
-                }
-                None => {
-                    if !only_mismatched || true {
-                        // Always show missing webhooks
-                        println!("{}: {} (webhook: {})", repo.full_name, repo.name, "missing");
+                    None => {
+                        if !only_mismatched || true {
+                            // Always show missing webhooks
+                            println!("{}: {} (webhook: missing)", repo.full_name, repo.name);
+                        }
                     }
                 }
             }
-        }
         }
     }
 
@@ -610,11 +614,7 @@ fn write_job_output(repos_discovered: usize, repos_already_correct: usize, repos
 }
 
 fn is_transient_error(err: &reqwest::Error) -> bool {
-    err.is_timeout()
-        || err.is_connect()
-        || err
-            .status()
-            .map_or(false, |s| s.is_server_error())
+    err.is_timeout() || err.is_connect() || err.status().is_some_and(|s| s.is_server_error())
 }
 
 fn send_with_retry(
@@ -645,7 +645,10 @@ fn send_with_retry(
                     let delay = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt);
                     warn!(
                         "Transient error: {}, retrying in {}ms (attempt {}/{})",
-                        err, delay, attempt + 1, MAX_RETRIES
+                        err,
+                        delay,
+                        attempt + 1,
+                        MAX_RETRIES
                     );
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     last_err = Some(err);
@@ -836,7 +839,7 @@ fn process_repository(
                 .config
                 .secret
                 .as_ref()
-                .map_or(false, |s| s.chars().all(|c| c == '*'));
+                .is_some_and(|s| s.chars().all(|c| c == '*'));
 
             // Only count secret as needing update if it's not masked or we're forcing secret updates
             let needs_secret_update = if is_secret_masked && !config.force_secret {
@@ -1030,7 +1033,7 @@ fn check_response_status(response: &Response) -> Result<(), AppError> {
             if response
                 .headers()
                 .get("X-RateLimit-Remaining")
-                .map_or(false, |v| v == "0")
+                .is_some_and(|v| v == "0")
             {
                 error!("GitHub API rate limit exceeded.");
                 Err(AppError::ApiError {
